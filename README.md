@@ -99,33 +99,38 @@ an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 T
 
 | lang | device | precision | render_s | render_fps |
 |------|--------|-----------|---------:|-----------:|
-| C++  | cpu    | f64       |   75.18  |  11.97 |
-| Rust | cpu    | f64       |  108.88  |   8.27 |
-| Go   | cpu    | f64       |   81.59  |  11.03 |
-| C++  | gpu    | f64       |   19.19  |  46.89 |
-| Rust | gpu    | f64       |   19.23  |  46.81 |
-| Go   | gpu    | f64       |   19.23  |  46.80 |
-| C++  | cpu    | deep      |  631.16  |   1.43 |
-| Rust | cpu    | deep      |  743.13  |   1.21 |
-| Go   | cpu    | deep      |  740.95  |   1.21 |
-| C++  | gpu    | deep      |  175.38  |   5.13 |
-| Rust | gpu    | deep      |  176.08  |   5.11 |
-| Go   | gpu    | deep      |  176.85  |   5.09 |
+| C++  | cpu    | f64       |   69.97  |  12.86 |
+| Rust | cpu    | f64       |   78.42  |  11.48 |
+| Go   | cpu    | f64       |   77.82  |  11.56 |
+| C++  | gpu    | f64       |   19.13  |  47.05 |
+| Rust | gpu    | f64       |   19.09  |  47.14 |
+| Go   | gpu    | f64       |   19.17  |  46.96 |
+| C++  | cpu    | deep      |  605.12  |   1.49 |
+| Rust | cpu    | deep      |  622.23  |   1.45 |
+| Go   | cpu    | deep      |  669.83  |   1.34 |
+| C++  | gpu    | deep      |  175.52  |   5.13 |
+| Rust | gpu    | deep      |  176.85  |   5.09 |
+| Go   | gpu    | deep      |  176.84  |   5.09 |
 
-The reference orbit takes ≤ 0.5 s in every language, so it is negligible.
+The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
+three languages are within 1% of each other, because they run the same kernel. On the CPU, C++
+is fastest. Rust and Go are about 11% slower in f64; in deep, Rust is 3% slower and Go 11%.
 
-**CPU fixes.** The Rust CPU rows and the Go deep CPU row above predate these fixes:
+**CPU fixes.** Two changes made before this run sped up the CPU code:
 - **Rust f64:** LLVM's SLP vectorizer was slowing the inner loop (see [Fairness notes](#fairness-notes)).
 - **Rust and Go deep:** the perturbation loop did four bounds checks per iteration. Both now
   carry `Z_m` over from the previous step and load the orbit as (re, im) pairs, with one
   bounds check per iteration. A Go profile (pprof) put 99% of the time in this loop.
 
-Output is still bit-identical. CPU timings after the fixes (same machine, without `nice`):
+Output is still bit-identical. Same benchmark (900 frames, `nice -19`) before and after:
 
-| precision | frames | C++ fps | Rust fps (before → after) | Go fps (before → after) |
-|-----------|-------:|--------:|--------------------------:|------------------------:|
-| f64       |    900 |   12.95 | 8.27 → 11.50              | 11.53                   |
-| deep      |    300 |    1.49 | 1.21 → 1.44               | 1.22 → 1.33             |
+| precision | C++ fps        | Rust fps        | Go fps          |
+|-----------|---------------:|----------------:|----------------:|
+| f64       | 11.97 → 12.86  |  8.27 → 11.48   | 11.03 → 11.56   |
+| deep      |  1.43 → 1.49   |  1.21 → 1.45    |  1.21 → 1.34    |
+
+C++ and Go f64 didn't change, so their small differences between the two runs are
+run-to-run noise.
 
 The remaining Go deep gap is code generation. Go's register allocator adds about 15
 register-to-register copies per iteration, and it reloads the escape-radius constant from memory
