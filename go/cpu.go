@@ -36,20 +36,32 @@ func (r *cpuRenderer) Render(f Frame, rgb []byte) error {
 			for y := int(nextRow.Add(1) - 1); y < r.height; y = int(nextRow.Add(1) - 1) {
 				row := rgb[y*r.width*3 : (y+1)*r.width*3]
 				dci := (0.5*float64(r.height) - (float64(y) + 0.5)) * f.Spacing
-				for x := range r.width {
-					dcr := (float64(x) + 0.5 - 0.5*float64(r.width)) * f.Spacing
-					px := row[3*x : 3*x+3]
-					if r.orbit != nil {
-						pixelPerturb(px, r.orbit, dcr, dci, f.MaxIter)
-					} else {
-						pixelF64(px, r.cre+dcr, r.cim+dci, f.MaxIter)
-					}
+				if r.orbit != nil {
+					rowPerturb(row, r.width, r.orbit, dci, f.Spacing, f.MaxIter)
+				} else {
+					rowF64(row, r.width, r.cre, r.cim+dci, f.Spacing, f.MaxIter)
 				}
 			}
 		})
 	}
 	wg.Wait()
 	return nil
+}
+
+// rowF64Scalar and rowPerturbScalar iterate one pixel at a time. They are used when the
+// SIMD version (cpu_simd.go) isn't built or the CPU lacks AVX2.
+func rowF64Scalar(row []byte, width int, cre, ciRow, spacing float64, maxIter int32) {
+	for x := range width {
+		dcr := (float64(x) + 0.5 - 0.5*float64(width)) * spacing
+		pixelF64(row[3*x:3*x+3], cre+dcr, ciRow, maxIter)
+	}
+}
+
+func rowPerturbScalar(row []byte, width int, ref [][2]float64, dci, spacing float64, maxIter int32) {
+	for x := range width {
+		dcr := (float64(x) + 0.5 - 0.5*float64(width)) * spacing
+		pixelPerturb(row[3*x:3*x+3], ref, dcr, dci, maxIter)
+	}
 }
 
 func pixelF64(px []byte, cr, ci float64, maxIter int32) {

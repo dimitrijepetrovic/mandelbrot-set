@@ -17,9 +17,9 @@ languages and not different maths.
 
 ```
 cuda/       shared CUDA kernels (mandel_f64, mandel_perturb), used by all three
-cpp/        C++20, CMake; CPU: std::jthread + atomic row counter; GPU: CUDA runtime <<<>>>
-rust/       Rust 2024, cargo; CPU: rayon; GPU: cudarc (driver API) + PTX built by build.rs
-go/         Go 1.26; CPU: goroutines + atomic row counter; GPU: cgo shim over the CUDA driver API
+cpp/        C++20, CMake; CPU: std::jthread + atomic row counter, auto-vectorized lanes; GPU: CUDA runtime <<<>>>
+rust/       Rust 2024, cargo; CPU: rayon, auto-vectorized lanes; GPU: cudarc (driver API) + PTX built by build.rs
+go/         Go 1.26; CPU: goroutines + atomic row counter, simd/archsimd lanes; GPU: cgo shim over the CUDA driver API
 scripts/    bench.sh (timing table), verify.sh (cross-language output check)
 tools/      misiurewicz.py (computes the default zoom centre to 340 digits)
 ```
@@ -31,7 +31,7 @@ C++, `astro-float` in Rust, `math/big` in Go.
 
 - g++ ≥ 13, CMake ≥ 3.24, GMP with C++ bindings (`libgmp-dev`)
 - Rust ≥ 1.85 (edition 2024)
-- Go ≥ 1.25
+- Go ≥ 1.26 (for the experimental `simd/archsimd` package)
 - CUDA toolkit (`nvcc`) and an NVIDIA driver; developed with CUDA 12.4 on an RTX 3080 Ti
 - `ffmpeg` on `PATH`
 
@@ -42,7 +42,13 @@ make                    # builds bin/mandelbrot-cpp, bin/mandelbrot-rust, bin/ma
 make cpp|rust|go        # one implementation
 make CUDA_ARCH=sm_86    # target a specific GPU (default: the local one)
 make CUDA_FMAD=false    # disable GPU fused multiply-add: bit-identical CPU vs GPU output
+make NATIVE=false       # portable CPU code (see below)
 ```
+
+By default the CPU code is built for the local CPU: `-march=native` (C++),
+`-C target-cpu=native` (Rust, in `rust/.cargo/config.toml`) and `GOEXPERIMENT=simd` (Go, which
+then uses AVX2 when the CPU has it). `NATIVE=false` builds for baseline x86-64, and Go then
+iterates one pixel at a time (`go/cpu_nosimd.go`). Both builds produce the same frames.
 
 ## Usage
 
@@ -93,58 +99,66 @@ depth, so every pixel takes thousands of iterations in the deep frames.
 
 ### Results
 
-A single run of `scripts/bench.sh` (1280×720, 900 frames, `--no-video`, run with `nice -19` on
-an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti Laptop GPU
-(2026-10-06):
+`scripts/bench.sh` (1280×720, 900 frames, `--no-video`, run with `nice -19` on an otherwise idle
+machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti Laptop GPU, default
+(`NATIVE=true`) build (2026-10-06). The CPU rows come from a CPU-only run after the lanes
+change. The GPU rows come from the previous full run; the GPU code didn't change.
 
 | lang | device | precision | render_s | render_fps |
 |------|--------|-----------|---------:|-----------:|
-| C++  | cpu    | f64       |   69.97  |  12.86 |
-| Rust | cpu    | f64       |   78.42  |  11.48 |
-| Go   | cpu    | f64       |   77.82  |  11.56 |
+| C++  | cpu    | f64       |   27.40  |  32.84 |
+| Rust | cpu    | f64       |   30.44  |  29.57 |
+| Go   | cpu    | f64       |   36.20  |  24.86 |
 | C++  | gpu    | f64       |   19.13  |  47.05 |
 | Rust | gpu    | f64       |   19.09  |  47.14 |
 | Go   | gpu    | f64       |   19.17  |  46.96 |
-| C++  | cpu    | deep      |  605.12  |   1.49 |
-| Rust | cpu    | deep      |  622.23  |   1.45 |
-| Go   | cpu    | deep      |  669.83  |   1.34 |
+| C++  | cpu    | deep      |  492.40  |   1.83 |
+| Rust | cpu    | deep      |  582.70  |   1.54 |
+| Go   | cpu    | deep      |  616.63  |   1.46 |
 | C++  | gpu    | deep      |  175.52  |   5.13 |
 | Rust | gpu    | deep      |  176.85  |   5.09 |
 | Go   | gpu    | deep      |  176.84  |   5.09 |
 
 The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
-three languages are within 1% of each other, because they run the same kernel. On the CPU, C++
-is fastest. Rust and Go are about 11% slower in f64; in deep, Rust is 3% slower and Go 11%.
+three languages are within 1% of each other, because they run the same kernel. In f64 the CPUs
+now reach 53–70% of the GPU's speed. Deep mode gains less on the CPU, because each lane loads
+its reference orbit entry from a different index on every step.
 
-**CPU fixes.** Two changes made before this run sped up the CPU code:
-- **Rust f64:** LLVM's SLP vectorizer was slowing the inner loop (see [Fairness notes](#fairness-notes)).
-- **Rust and Go deep:** the perturbation loop did four bounds checks per iteration. Both now
-  carry `Z_m` over from the previous step and load the orbit as (re, im) pairs, with one
-  bounds check per iteration. A Go profile (pprof) put 99% of the time in this loop.
+**CPU history.** Render fps over the same benchmark:
 
-Output is still bit-identical. Same benchmark (900 frames, `nice -19`) before and after:
+| precision | lang | original | bounds checks + SLP fix | 8 SIMD lanes + native |
+|-----------|------|---------:|------------------------:|----------------------:|
+| f64       | C++  |  11.97   | 12.86                   | **32.84**             |
+| f64       | Rust |   8.27   | 11.48                   | **29.57**             |
+| f64       | Go   |  11.03   | 11.56                   | **24.86**             |
+| deep      | C++  |   1.43   |  1.49                   | **1.83**              |
+| deep      | Rust |   1.21   |  1.45                   | **1.54**              |
+| deep      | Go   |   1.21   |  1.34                   | **1.46**              |
 
-| precision | C++ fps        | Rust fps        | Go fps          |
-|-----------|---------------:|----------------:|----------------:|
-| f64       | 11.97 → 12.86  |  8.27 → 11.48   | 11.03 → 11.56   |
-| deep      |  1.43 → 1.49   |  1.21 → 1.45    |  1.21 → 1.34    |
+1. **Bounds checks + SLP fix:** the Rust and Go perturbation loops did four bounds checks per
+   iteration and now do one. Rust's f64 loop had been slowed by LLVM's SLP vectorizer packing
+   the real and imaginary parts of one pixel. pprof showed 99% of Go's time in that loop.
+2. **8 SIMD lanes + native:** a profile (callgrind for C++, pprof for Go) and a
+   microbenchmark showed the one-pixel loop was latency-bound, at about 9.5 cycles per
+   iteration. Each worker now iterates 8 pixels at once in SIMD registers (see
+   [CPU lanes](#algorithm)), with `-march=native` / `target-cpu=native` / `GOEXPERIMENT=simd`.
 
-C++ and Go f64 didn't change, so their small differences between the two runs are
-run-to-run noise.
-
-The remaining Go deep gap is code generation. Go's register allocator adds about 15
-register-to-register copies per iteration, and it reloads the escape-radius constant from memory
-each time.
+Remaining gaps:
+- **Go:** it needs explicit SIMD, because its compiler doesn't auto-vectorize, and the Go
+  compiler still keeps more values in memory than GCC or LLVM do.
+- **Rust deep:** LLVM fully unrolls the 8-lane loop and then vectorizes less of it than GCC
+  does.
 
 ### Fairness notes
 
-- All builds target the baseline x86-64 ISA (no `-march=native`, no FMA), so the three CPU
-  versions do the same floating-point operations. This is also what makes their output
-  bit-identical.
-- Rust is built with LLVM's SLP vectorizer off (`rust/.cargo/config.toml`). With it on, LLVM
-  packs the real and imaginary halves of `z² + c` into one SSE2 register. The shuffles this
-  needs sit on the loop's dependency chain, which made the f64 CPU loop about 25% slower. GCC
-  and Go don't do this.
+- The three CPU versions do the same floating-point operations in the same order, which is what
+  makes their output bit-identical. Fused multiply-add (FMA) is off everywhere on the CPU, even
+  though `-march=native` makes it available. C++ uses `-ffp-contract=off`. Rust never fuses on
+  its own. Go would fuse scalar `x*y + z` with `GOAMD64=v3`, so Go is built with the default
+  `GOAMD64=v1`; its SIMD package uses AVX2 regardless.
+- The CPU loops are vectorized differently. GCC and LLVM vectorize plain loops over the 8 lanes.
+  Go doesn't auto-vectorize, so its lanes are written with the experimental `simd/archsimd`
+  package as two 4-wide AVX2 vectors.
 - All CPU versions split the work by rows with dynamic scheduling: an atomic counter in C++ and
   Go, rayon work stealing in Rust.
 - The GPU kernel is the same PTX/SASS for all three, so GPU numbers mostly differ in host
@@ -172,6 +186,14 @@ and C, and the chaotic iteration magnifies such a difference into visibly differ
    in f64. The pixel offset `δc` is tiny (down to 1e-303) but well within f64 range.
 3. Glitches are avoided by **rebasing** (Zhuoran): when `|Z_m + δz| < |δz|`, or the reference
    runs out, set `δz ← Z_m + δz` and restart at `m = 0`.
+
+**CPU lanes.** One pixel's iterations form a serial dependency chain: each step needs the
+previous `z`, so a single pixel leaves the core mostly idle. Each CPU worker therefore iterates
+8 pixels of a row at once, in SIMD registers. When a lane escapes or reaches `max_iter`, its
+pixel is coloured and the lane is refilled with the row's next pixel. In deep mode each step
+first loads every lane's `Z_m` and `Z_m+1` (lanes are at different orbit indices), then does the
+arithmetic in vectors, then updates `m`. Every lane does exactly the scalar operations of the
+one-pixel loop, so the output is unchanged.
 
 **Colour.** Smooth iteration count `ν = n + 1 − log2(ln|z|/ln 2)`, then a cosine palette
 `0.5 + 0.5·cos(2π(0.015ν + φ))` with phases φ = 0, 0.15, 0.30 for R, G, B. Points that don't

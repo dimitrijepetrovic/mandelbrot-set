@@ -14,6 +14,9 @@ endif()
 # FMA contraction makes GPU results differ slightly from the (non-FMA) CPU
 # builds; configure with -DCUDA_FMAD=OFF for bit-identical CPU/GPU output.
 option(CUDA_FMAD "Allow fused multiply-add in CUDA kernels" ON)
+# Optimise the host code for this machine's CPU (AVX2 etc.). Fused multiply-add stays
+# off (-ffp-contract=off) so the CPU output matches the Rust and Go builds bit for bit.
+option(NATIVE "Compile host code with -march=native" ON)
 
 find_package(Threads REQUIRED)
 find_package(CUDAToolkit REQUIRED)
@@ -29,7 +32,10 @@ add_executable(mandelbrot
   src/gpu.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/../cuda/mandelbrot.cu)
 target_include_directories(mandelbrot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../cuda)
-target_compile_options(mandelbrot PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra>)
+target_compile_options(mandelbrot PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -ffp-contract=off -Wall -Wextra>)
+if(NATIVE)
+  target_compile_options(mandelbrot PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+endif()
 if(NOT CUDA_FMAD)
   target_compile_options(mandelbrot PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
