@@ -113,12 +113,13 @@ Laptop GPU, default (`NATIVE=true`) build (2026-10-06):
 | Go   | gpu    | f64       |   19.16  |  46.98 |
 | C++  | cpu    | deep      |  496.17  |   1.81 |
 | Rust | cpu    | deep      |  471.31* |   1.91 |
-| Go   | cpu    | deep      |  617.61  |   1.46 |
+| Go   | cpu    | deep      |  533.75* |   1.69 |
 | C++  | gpu    | deep      |  175.48  |   5.13 |
 | Rust | gpu    | deep      |  176.85  |   5.09 |
 | Go   | gpu    | deep      |  176.84  |   5.09 |
 
-\* Rust CPU deep was re-run alone after the fix described under "Rust deep" below.
+\* Rust and Go CPU deep were each re-run alone after the fixes described under "Rust deep"
+and "Go deep" below.
 
 The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
 three languages are within 1% of each other, because they run the same kernel. In f64 the CPUs
@@ -134,7 +135,7 @@ its reference orbit entry from a different index on every step.
 | f64       | Go   |  11.03   | 11.56                   | **24.69**             |
 | deep      | C++  |   1.43   |  1.49                   | **1.81**              |
 | deep      | Rust |   1.21   |  1.45                   | 1.54 → **1.91**       |
-| deep      | Go   |   1.21   |  1.34                   | **1.46**              |
+| deep      | Go   |   1.21   |  1.34                   | 1.46 → **1.69**       |
 
 1. **Bounds checks + SLP fix:** the Rust and Go perturbation loops did four bounds checks per
    iteration and now do one. Rust's f64 loop had been slowed by LLVM's SLP vectorizer packing
@@ -154,6 +155,16 @@ disassembly showed two overheads in the per-lane orbit loads:
 Each lane now loads `Z_m` and `Z_m+1` as one 2-element window, with one bounds check, and the
 end test is done inside the vectorized loop as one vector compare. That took Rust deep from
 1.54 to 1.91 fps, ahead of C++.
+
+**Go deep.** pprof put about 30% of the time in the per-lane orbit loads and about 18% in a
+branchy scalar loop updating each lane's `m`:
+- The loads were 16 bounds-checked 128-bit loads per step.
+- Rebases are frequent and unpredictable, so that loop's branches often mispredicted.
+
+Now each lane's `Z_m, Z_m+1` comes in as one 4-wide load from the flat orbit, with one bounds
+check, and the four lanes are transposed in registers. `m` lives in an integer vector, updated
+with a vector select and stored once per step for the next step's loads. That took Go deep
+from 1.46 to 1.69 fps.
 
 **Remaining gap.** Go needs explicit SIMD because its compiler doesn't auto-vectorize, and the
 Go compiler still keeps more values in memory than GCC or LLVM do.

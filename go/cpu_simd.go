@@ -5,6 +5,7 @@ package main
 import (
 	"math"
 	"simd/archsimd"
+	"unsafe"
 )
 
 // Each worker iterates 8 pixels of a row at once, as two AVX2 vectors of 4 lanes. One
@@ -122,22 +123,28 @@ func rowF64(row []byte, width int, cre, ciRow, spacing float64, maxIter int32) {
 	}
 }
 
-// orbitAt loads the orbit entries ref[m[0..3]+off] as (re, im) vectors. Pairs are loaded
-// straight from the orbit and shuffled in registers: writing them to an array and loading
-// that as one vector would stall on store forwarding.
-func orbitAt(ref [][2]float64, m []int, off int) (re, im f64x4) {
-	x := f64x4{}.SetLo(archsimd.LoadFloat64x2(&ref[m[0]+off])).SetHi(archsimd.LoadFloat64x2(&ref[m[2]+off]))
-	y := f64x4{}.SetLo(archsimd.LoadFloat64x2(&ref[m[1]+off])).SetHi(archsimd.LoadFloat64x2(&ref[m[3]+off]))
-	return x.SelectFromPairGrouped(0, 2, y), x.SelectFromPairGrouped(1, 3, y)
+type i64x4 = archsimd.Int64x4
+
+// orbitAt loads Z_m and Z_m+1 for lanes m[0..3] as (re, im) vectors. Each lane's two
+// entries are adjacent in the flat orbit, so they come in as one 4-wide load (one bounds
+// check), and the four lanes are transposed in registers.
+func orbitAt(flat []float64, m *[lanes]int64, base int) (zmr, zmi, znr, zni f64x4) {
+	lane := func(k int) f64x4 {
+		i := 2 * int(m[base+k])
+		return archsimd.LoadFloat64x4((*[4]float64)(flat[i : i+4])) // Z_m.re, Z_m.im, Z_m+1.re, Z_m+1.im
+	}
+	a, b, c, d := lane(0), lane(1), lane(2), lane(3)
+	t0, t1 := a.Select128FromPair(0, 2, c), b.Select128FromPair(0, 2, d) // Z_m of a, c / b, d
+	t2, t3 := a.Select128FromPair(1, 3, c), b.Select128FromPair(1, 3, d) // Z_m+1
+	return t0.SelectFromPairGrouped(0, 2, t1), t0.SelectFromPairGrouped(1, 3, t1),
+		t2.SelectFromPairGrouped(0, 2, t3), t2.SelectFromPairGrouped(1, 3, t3)
 }
 
-// perturbCore and rebase are one iteration of dz <- (2Z_m + dz) dz + dc for lanes
-// m[0..3], with z = Z_m+1 + dz checked for escape and rebasing. They are two functions
-// so that each is small enough for Go to inline (as one, it would be called, and the
-// vectors passed through memory).
-func perturbCore(ref [][2]float64, m []int, dzr, dzi, dcr, dci, two f64x4) (nr, ni, zr, zi, r2 f64x4) {
-	zmr, zmi := orbitAt(ref, m, 0)
-	znr, zni := orbitAt(ref, m, 1)
+// perturbCore and rebase are one iteration of dz <- (2Z_m + dz) dz + dc for 4 lanes,
+// with z = Z_m+1 + dz checked for escape and rebasing. They are two functions so that
+// each is small enough for Go to inline (as one, it would be called, and the vectors
+// passed through memory).
+func perturbCore(zmr, zmi, znr, zni, dzr, dzi, dcr, dci, two f64x4) (nr, ni, zr, zi, r2 f64x4) {
 	tr := two.Mul(zmr).Add(dzr)
 	ti := two.Mul(zmi).Add(dzi)
 	nr = tr.Mul(dzr).Sub(ti.Mul(dzi)).Add(dcr)
@@ -148,9 +155,9 @@ func perturbCore(ref [][2]float64, m []int, dzr, dzi, dcr, dci, two f64x4) (nr, 
 
 // rebase (Zhuoran) restarts the reference when z gets closer to 0 than dz, or at the
 // end of the orbit: dz = rb ? z : dz, m = rb ? 0 : m+1.
-func rebase(nr, ni, zr, zi, r2, mf, one, lastm1 f64x4) (f64x4, f64x4, f64x4, f64x4, archsimd.Mask64x4) {
-	rb := r2.Less(nr.Mul(nr).Add(ni.Mul(ni))).Or(mf.Equal(lastm1))
-	return zr.Merge(nr, rb), zi.Merge(ni, rb), r2, f64x4{}.Merge(mf.Add(one), rb), rb
+func rebase(nr, ni, zr, zi, r2 f64x4, m, one, lastm1 i64x4) (f64x4, f64x4, i64x4) {
+	rb := r2.Less(nr.Mul(nr).Add(ni.Mul(ni))).Or(m.Equal(lastm1))
+	return zr.Merge(nr, rb), zi.Merge(ni, rb), i64x4{}.Merge(m.Add(one), rb)
 }
 
 // rowPerturb iterates dz <- (2Z + dz) dz + dc around the reference orbit, with rebasing.
@@ -159,12 +166,14 @@ func rowPerturb(row []byte, width int, ref [][2]float64, dci, spacing float64, m
 		rowPerturbScalar(row, width, ref, dci, spacing, maxIter)
 		return
 	}
+	flat := unsafe.Slice(&ref[0][0], 2*len(ref)) // the orbit as re, im, re, im, ...
 	last := len(ref) - 1
-	var dzr, dzi, dcr, r2, n, lim, mf, live [lanes]float64 // live: 1 for lanes holding a pixel
-	var m, px [lanes]int
+	var dzr, dzi, dcr, r2, n, lim, live [lanes]float64 // live: 1 for lanes holding a pixel
+	var m [lanes]int64
+	var px [lanes]int
 	fd := feed{width: width}
 	reset := func(k int) {
-		dzr[k], dzi[k], n[k], m[k], mf[k] = 0, 0, 0, 0, 0
+		dzr[k], dzi[k], n[k], m[k] = 0, 0, 0, 0
 		if x := fd.take(); x != idle {
 			dcr[k], lim[k], px[k], live[k] = (float64(x)+0.5-0.5*float64(width))*spacing, float64(maxIter), x, 1
 		} else { // idle lane: follows the reference orbit and is never checked
@@ -176,30 +185,28 @@ func rowPerturb(row []byte, width int, ref [][2]float64, dci, spacing float64, m
 	}
 	two, one, esc := archsimd.BroadcastFloat64x4(2), archsimd.BroadcastFloat64x4(1), archsimd.BroadcastFloat64x4(escapeR2)
 	vdci, zero := archsimd.BroadcastFloat64x4(dci), archsimd.BroadcastFloat64x4(0)
-	lastm1 := archsimd.BroadcastFloat64x4(float64(last - 1)) // m+1 == last
+	oneI, lastm1 := archsimd.BroadcastInt64x4(1), archsimd.BroadcastInt64x4(int64(last-1)) // m+1 == last
+	mLo, mHi := (*[4]int64)(m[0:4]), (*[4]int64)(m[4:8])
 	for fd.active > 0 {
 		dzrL, dzrH := load(&dzr)
 		dziL, dziH := load(&dzi)
 		dcrL, dcrH := load(&dcr)
 		nL, nH := load(&n)
 		limL, limH := load(&lim)
-		mfL, mfH := load(&mf)
 		liveL, liveH := load(&live)
+		mL, mH := archsimd.LoadInt64x4(mLo), archsimd.LoadInt64x4(mHi)
 		var r2L, r2H f64x4
 		for {
-			var rbL, rbH archsimd.Mask64x4
-			nr, ni, zr, zi, r2 := perturbCore(ref, m[0:4], dzrL, dziL, dcrL, vdci, two)
-			dzrL, dziL, r2L, mfL, rbL = rebase(nr, ni, zr, zi, r2, mfL, one, lastm1)
-			nr, ni, zr, zi, r2 = perturbCore(ref, m[4:8], dzrH, dziH, dcrH, vdci, two)
-			dzrH, dziH, r2H, mfH, rbH = rebase(nr, ni, zr, zi, r2, mfH, one, lastm1)
-			rebase := rbL.ToBits() | rbH.ToBits()<<4
-			for k := range lanes {
-				if rebase&(1<<k) != 0 {
-					m[k] = 0
-				} else {
-					m[k]++
-				}
-			}
+			zmr, zmi, znr, zni := orbitAt(flat, &m, 0)
+			nr, ni, zr, zi, r2 := perturbCore(zmr, zmi, znr, zni, dzrL, dziL, dcrL, vdci, two)
+			dzrL, dziL, mL = rebase(nr, ni, zr, zi, r2, mL, oneI, lastm1)
+			r2L = r2
+			zmr, zmi, znr, zni = orbitAt(flat, &m, 4)
+			nr, ni, zr, zi, r2 = perturbCore(zmr, zmi, znr, zni, dzrH, dziH, dcrH, vdci, two)
+			dzrH, dziH, mH = rebase(nr, ni, zr, zi, r2, mH, oneI, lastm1)
+			r2H = r2
+			mL.Store(mLo) // the next step's orbit loads index with these
+			mH.Store(mHi)
 			nL, nH = nL.Add(one), nH.Add(one)
 			doneL := r2L.Greater(esc).And(liveL.Greater(zero)).Or(nL.GreaterEqual(limL))
 			doneH := r2H.Greater(esc).And(liveH.Greater(zero)).Or(nH.GreaterEqual(limH))
@@ -211,7 +218,6 @@ func rowPerturb(row []byte, width int, ref [][2]float64, dci, spacing float64, m
 		store(&dzi, dziL, dziH)
 		store(&n, nL, nH)
 		store(&r2, r2L, r2H)
-		store(&mf, mfL, mfH)
 		for k := range lanes {
 			if px[k] == idle || !(r2[k] > escapeR2 || n[k] >= lim[k]) {
 				continue
