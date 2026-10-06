@@ -1,0 +1,6 @@
+/bin/
+/cpp/build/
+/rust/target/
+/go/mandelbrot.ptx
+/out/
+*.mp4

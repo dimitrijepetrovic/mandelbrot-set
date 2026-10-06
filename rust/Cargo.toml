@@ -1,0 +1,14 @@
+[package]
+name = "mandelbrot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+astro-float = "0.9"
+clap = { version = "4", features = ["derive"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading"] }
+rayon = "1"
+
+[profile.release]
+codegen-units = 1
