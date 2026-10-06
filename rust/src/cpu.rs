@@ -179,10 +179,11 @@ fn row_perturb(row: &mut [u8], w: usize, r: &[f64], dci: f64, spacing: f64, max_
     while feed.active > 0 {
         // Three passes, so the arithmetic is a straight-line block LLVM can vectorize:
         // load each lane's Z_m and Z_m+1 (different indices per lane), step, update m.
-        let (mut zm, mut zn, mut end) = ([[0.0f64; 2]; LANES], [[0.0f64; 2]; LANES], [false; LANES]);
+        // Each lane's two entries come from one 2-element window: one bounds check.
+        let (mut zm, mut zn) = ([[0.0f64; 2]; LANES], [[0.0f64; 2]; LANES]);
         for k in 0..LANES {
-            let m = l.m[k];
-            (zm[k], zn[k], end[k]) = (r[m], r[m + 1], m + 1 == last);
+            let w = &r[l.m[k]..l.m[k] + 2];
+            (zm[k], zn[k]) = (w[0], w[1]);
         }
         let mut any = false;
         let mut rebase = [false; LANES];
@@ -197,7 +198,7 @@ fn row_perturb(row: &mut [u8], w: usize, r: &[f64], dci: f64, spacing: f64, max_
             l.n[k] += 1.0;
             any |= (rk > ESCAPE_R2) & (l.px[k] != IDLE) | (l.n[k] >= l.lim[k]);
             // Rebase (Zhuoran): restart the reference when z gets closer to 0 than dz.
-            rebase[k] = (rk < nr * nr + ni * ni) | end[k];
+            rebase[k] = (rk < nr * nr + ni * ni) | (l.m[k] + 1 == last);
             l.dzr[k] = if rebase[k] { zr } else { nr };
             l.dzi[k] = if rebase[k] { zi } else { ni };
         }

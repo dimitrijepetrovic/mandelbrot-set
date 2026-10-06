@@ -112,11 +112,13 @@ Laptop GPU, default (`NATIVE=true`) build (2026-10-06):
 | Rust | gpu    | f64       |   19.15  |  47.01 |
 | Go   | gpu    | f64       |   19.16  |  46.98 |
 | C++  | cpu    | deep      |  496.17  |   1.81 |
-| Rust | cpu    | deep      |  583.73  |   1.54 |
+| Rust | cpu    | deep      |  471.31* |   1.91 |
 | Go   | cpu    | deep      |  617.61  |   1.46 |
 | C++  | gpu    | deep      |  175.48  |   5.13 |
 | Rust | gpu    | deep      |  176.85  |   5.09 |
 | Go   | gpu    | deep      |  176.84  |   5.09 |
+
+\* Rust CPU deep was re-run alone after the fix described under "Rust deep" below.
 
 The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
 three languages are within 1% of each other, because they run the same kernel. In f64 the CPUs
@@ -131,7 +133,7 @@ its reference orbit entry from a different index on every step.
 | f64       | Rust |   8.27   | 11.48                   | **28.99**             |
 | f64       | Go   |  11.03   | 11.56                   | **24.69**             |
 | deep      | C++  |   1.43   |  1.49                   | **1.81**              |
-| deep      | Rust |   1.21   |  1.45                   | **1.54**              |
+| deep      | Rust |   1.21   |  1.45                   | 1.54 → **1.91**       |
 | deep      | Go   |   1.21   |  1.34                   | **1.46**              |
 
 1. **Bounds checks + SLP fix:** the Rust and Go perturbation loops did four bounds checks per
@@ -142,11 +144,19 @@ its reference orbit entry from a different index on every step.
    iteration. Each worker now iterates 8 pixels at once in SIMD registers (see
    [CPU lanes](#algorithm)), with `-march=native` / `target-cpu=native` / `GOEXPERIMENT=simd`.
 
-Remaining gaps:
-- **Go:** it needs explicit SIMD, because its compiler doesn't auto-vectorize, and the Go
-  compiler still keeps more values in memory than GCC or LLVM do.
-- **Rust deep:** LLVM fully unrolls the 8-lane loop and then vectorizes less of it than GCC
-  does.
+**Rust deep.** Callgrind showed Rust doing only 3% more instructions than C++ in deep mode,
+but taking 34% longer single-threaded, so the cost was stalls, not extra work. The
+disassembly showed two overheads in the per-lane orbit loads:
+- They did 16 bounds checks per step.
+- The end-of-orbit flag (`m + 1 == last`) was built as 8 scalar bools and then packed into a
+  vector mask through a chain of byte inserts and shuffles.
+
+Each lane now loads `Z_m` and `Z_m+1` as one 2-element window, with one bounds check, and the
+end test is done inside the vectorized loop as one vector compare. That took Rust deep from
+1.54 to 1.91 fps, ahead of C++.
+
+**Remaining gap.** Go needs explicit SIMD because its compiler doesn't auto-vectorize, and the
+Go compiler still keeps more values in memory than GCC or LLVM do.
 
 ### Fairness notes
 
