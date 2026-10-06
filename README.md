@@ -82,7 +82,7 @@ lang=rust device=gpu precision=f64 size=1920x1080 frames=600 zoom=1e+12 ref_s=0.
 ## Benchmarking
 
 ```sh
-scripts/bench.sh                         # all 12 combinations, 720p, 5 s, no video
+scripts/bench.sh                         # all 12 combinations, 720p, 30 s, no video
 scripts/bench.sh --duration 20           # extra flags go to every run
 VIDEO=1 scripts/bench.sh                 # also write the videos to out/
 LANGS="cpp go" DEVICES=gpu PRECISIONS=f64 scripts/bench.sh
@@ -93,31 +93,48 @@ depth, so every pixel takes thousands of iterations in the deep frames.
 
 ### Results
 
-A single run of `scripts/bench.sh` (1280×720, 150 frames, `--no-video`) on an Intel i9-12900H
-(20 threads) with an RTX 3080 Ti Laptop GPU (2026-10-06):
+A single run of `scripts/bench.sh` (1280×720, 900 frames, `--no-video`, run with `nice -19` on
+an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti Laptop GPU
+(2026-10-06):
 
 | lang | device | precision | render_s | render_fps |
 |------|--------|-----------|---------:|-----------:|
-| C++  | cpu    | f64       |   26.07  |   5.75 |
-| Rust | cpu    | f64       |   35.57  |   4.22 |
-| Go   | cpu    | f64       |   25.67  |   5.84 |
-| C++  | gpu    | f64       |    3.32  |  45.19 |
-| Rust | gpu    | f64       |    3.27  |  45.85 |
-| Go   | gpu    | f64       |    3.28  |  45.68 |
-| C++  | cpu    | deep      |  189.77  |   0.79 |
-| Rust | cpu    | deep      |  220.80  |   0.68 |
-| Go   | cpu    | deep      |  223.32  |   0.67 |
-| C++  | gpu    | deep      |   29.78  |   5.04 |
-| Rust | gpu    | deep      |   30.02  |   5.00 |
-| Go   | gpu    | deep      |   30.46  |   4.92 |
+| C++  | cpu    | f64       |   75.18  |  11.97 |
+| Rust | cpu    | f64       |  108.88  |   8.27 |
+| Go   | cpu    | f64       |   81.59  |  11.03 |
+| C++  | gpu    | f64       |   19.19  |  46.89 |
+| Rust | gpu    | f64       |   19.23  |  46.81 |
+| Go   | gpu    | f64       |   19.23  |  46.80 |
+| C++  | cpu    | deep      |  631.16  |   1.43 |
+| Rust | cpu    | deep      |  743.13  |   1.21 |
+| Go   | cpu    | deep      |  740.95  |   1.21 |
+| C++  | gpu    | deep      |  175.38  |   5.13 |
+| Rust | gpu    | deep      |  176.08  |   5.11 |
+| Go   | gpu    | deep      |  176.85  |   5.09 |
 
-The reference orbit takes ≤ 0.013 s in every language, so it is negligible.
+The reference orbit takes ≤ 0.5 s in every language, so it is negligible.
+
+**Rust CPU fix.** The Rust CPU rows above predate two fixes:
+- **f64:** LLVM's SLP vectorizer was slowing the inner loop (see [Fairness notes](#fairness-notes)).
+- **deep:** the perturbation loop did four bounds checks per iteration. It now carries `Z_m`
+  over from the previous step and does one load per iteration.
+
+Output is still bit-identical. CPU timings after the fixes (same machine, without `nice`):
+
+| precision | frames | C++ fps | Rust fps (before → after) | Go fps |
+|-----------|-------:|--------:|--------------------------:|-------:|
+| f64       |    900 |   12.95 | 8.27 → 11.50              |  11.53 |
+| deep      |    300 |    1.49 | 1.21 → 1.44               |   1.22 |
 
 ### Fairness notes
 
 - All builds target the baseline x86-64 ISA (no `-march=native`, no FMA), so the three CPU
   versions do the same floating-point operations. This is also what makes their output
   bit-identical.
+- Rust is built with LLVM's SLP vectorizer off (`rust/.cargo/config.toml`). With it on, LLVM
+  packs the real and imaginary halves of `z² + c` into one SSE2 register. The shuffles this
+  needs sit on the loop's dependency chain, which made the f64 CPU loop about 25% slower. GCC
+  and Go don't do this.
 - All CPU versions split the work by rows with dynamic scheduling: an atomic counter in C++ and
   Go, rayon work stealing in Rust.
 - The GPU kernel is the same PTX/SASS for all three, so GPU numbers mostly differ in host

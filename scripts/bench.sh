@@ -20,7 +20,7 @@ for precision in $PRECISIONS; do
       [[ ${VIDEO:-0} == 1 ]] && video=(--output "out/mandelbrot_${lang}_${device}_${precision}.mp4")
       echo ">> $lang $device $precision" >&2
       "bin/mandelbrot-$lang" --device "$device" --precision "$precision" \
-        --width 1280 --height 720 --duration 5 "${video[@]}" "$@" | tee -a "$log"
+        --width 1280 --height 720 --duration 30 "${video[@]}" "$@" | tee -a "$log"
     done
   done
 done

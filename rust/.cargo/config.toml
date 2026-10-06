@@ -1,0 +1,5 @@
+# LLVM's SLP vectorizer packs the (re, im) halves of the escape-time loops into SSE2
+# registers. The extra shuffles sit on the loop-carried dependency chain and make the
+# latency-bound loop ~25% slower, so turn it off (GCC and Go don't do this).
+[build]
+rustflags = ["-C", "llvm-args=-vectorize-slp=false"]

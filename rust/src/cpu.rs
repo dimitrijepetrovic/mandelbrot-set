@@ -43,7 +43,9 @@ impl Renderer for CpuRenderer {
 #[inline]
 fn pixel_f64(px: &mut [u8], cr: f64, ci: f64, max_iter: i32) {
     let (mut zr, mut zi) = (0.0f64, 0.0f64);
-    for n in 1..=max_iter {
+    // `1..max_iter + 1`, not `1..=max_iter`: RangeInclusive's extra exhausted flag
+    // costs a branch per iteration in this latency-bound loop.
+    for n in 1..max_iter + 1 {
         let (zr2, zi2) = (zr * zr, zi * zi);
         zi = 2.0 * zr * zi + ci;
         zr = zr2 - zi2 + cr;
@@ -57,27 +59,33 @@ fn pixel_f64(px: &mut [u8], cr: f64, ci: f64, max_iter: i32) {
 
 #[inline]
 fn pixel_perturb(px: &mut [u8], r: &[f64], dcr: f64, dci: f64, max_iter: i32) {
-    let ref_len = r.len() / 2;
+    // View the orbit as (re, im) pairs and carry Z_m over from the previous step, so each
+    // iteration does one bounds-checked load instead of four.
+    let (r, _) = r.as_chunks::<2>();
+    let last = r.len() - 1;
     let (mut dzr, mut dzi) = (0.0f64, 0.0f64);
+    let [mut zmr, mut zmi] = r[0];
     let mut m = 0usize;
-    for n in 1..=max_iter {
+    for n in 1..max_iter + 1 {
         // dz' = (2Z + dz) dz + dc
-        let tr = 2.0 * r[2 * m] + dzr;
-        let ti = 2.0 * r[2 * m + 1] + dzi;
+        let tr = 2.0 * zmr + dzr;
+        let ti = 2.0 * zmi + dzi;
         let nr = tr * dzr - ti * dzi + dcr;
         dzi = tr * dzi + ti * dzr + dci;
         dzr = nr;
         m += 1;
-        let zr = r[2 * m] + dzr;
-        let zi = r[2 * m + 1] + dzi;
+        [zmr, zmi] = r[m];
+        let zr = zmr + dzr;
+        let zi = zmi + dzi;
         let r2 = zr * zr + zi * zi;
         if r2 > ESCAPE_R2 {
             return colour(px, n, r2);
         }
-        if r2 < dzr * dzr + dzi * dzi || m == ref_len - 1 {
+        if r2 < dzr * dzr + dzi * dzi || m == last {
             dzr = zr; // rebase onto the start of the orbit
             dzi = zi;
             m = 0;
+            [zmr, zmi] = r[0];
         }
     }
     px.fill(0);
