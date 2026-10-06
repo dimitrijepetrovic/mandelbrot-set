@@ -114,17 +114,22 @@ an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 T
 
 The reference orbit takes ≤ 0.5 s in every language, so it is negligible.
 
-**Rust CPU fix.** The Rust CPU rows above predate two fixes:
-- **f64:** LLVM's SLP vectorizer was slowing the inner loop (see [Fairness notes](#fairness-notes)).
-- **deep:** the perturbation loop did four bounds checks per iteration. It now carries `Z_m`
-  over from the previous step and does one load per iteration.
+**CPU fixes.** The Rust CPU rows and the Go deep CPU row above predate these fixes:
+- **Rust f64:** LLVM's SLP vectorizer was slowing the inner loop (see [Fairness notes](#fairness-notes)).
+- **Rust and Go deep:** the perturbation loop did four bounds checks per iteration. Both now
+  carry `Z_m` over from the previous step and load the orbit as (re, im) pairs, with one
+  bounds check per iteration. A Go profile (pprof) put 99% of the time in this loop.
 
 Output is still bit-identical. CPU timings after the fixes (same machine, without `nice`):
 
-| precision | frames | C++ fps | Rust fps (before → after) | Go fps |
-|-----------|-------:|--------:|--------------------------:|-------:|
-| f64       |    900 |   12.95 | 8.27 → 11.50              |  11.53 |
-| deep      |    300 |    1.49 | 1.21 → 1.44               |   1.22 |
+| precision | frames | C++ fps | Rust fps (before → after) | Go fps (before → after) |
+|-----------|-------:|--------:|--------------------------:|------------------------:|
+| f64       |    900 |   12.95 | 8.27 → 11.50              | 11.53                   |
+| deep      |    300 |    1.49 | 1.21 → 1.44               | 1.22 → 1.33             |
+
+The remaining Go deep gap is code generation. Go's register allocator adds about 15
+register-to-register copies per iteration, and it reloads the escape-radius constant from memory
+each time.
 
 ### Fairness notes
 

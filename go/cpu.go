@@ -9,7 +9,7 @@ import (
 type cpuRenderer struct {
 	width, height, threads int
 	cre, cim               float64
-	orbit                  []float64
+	orbit                  [][2]float64 // (re, im) pairs: one bounds check per load
 }
 
 func newCPURenderer(o Options, cre, cim float64, orbit []float64) *cpuRenderer {
@@ -17,7 +17,14 @@ func newCPURenderer(o Options, cre, cim float64, orbit []float64) *cpuRenderer {
 	if threads <= 0 {
 		threads = runtime.NumCPU()
 	}
-	return &cpuRenderer{o.Width, o.Height, threads, cre, cim, orbit}
+	var pairs [][2]float64
+	if orbit != nil {
+		pairs = make([][2]float64, len(orbit)/2)
+		for i := range pairs {
+			pairs[i] = [2]float64{orbit[2*i], orbit[2*i+1]}
+		}
+	}
+	return &cpuRenderer{o.Width, o.Height, threads, cre, cim, pairs}
 }
 
 func (r *cpuRenderer) Render(f Frame, rgb []byte) error {
@@ -60,27 +67,31 @@ func pixelF64(px []byte, cr, ci float64, maxIter int32) {
 	px[0], px[1], px[2] = 0, 0, 0
 }
 
-func pixelPerturb(px []byte, ref []float64, dcr, dci float64, maxIter int32) {
-	refLen := len(ref) / 2
+func pixelPerturb(px []byte, ref [][2]float64, dcr, dci float64, maxIter int32) {
+	// Carry Z_m over from the previous step, so each iteration loads one orbit entry.
+	last := len(ref) - 1
 	var dzr, dzi float64
+	zmr, zmi := ref[0][0], ref[0][1]
 	m := 0
 	for n := int32(1); n <= maxIter; n++ {
 		// dz' = (2Z + dz) dz + dc
-		tr := 2.0*ref[2*m] + dzr
-		ti := 2.0*ref[2*m+1] + dzi
+		tr := 2.0*zmr + dzr
+		ti := 2.0*zmi + dzi
 		nr := tr*dzr - ti*dzi + dcr
 		dzi = tr*dzi + ti*dzr + dci
 		dzr = nr
 		m++
-		zr := ref[2*m] + dzr
-		zi := ref[2*m+1] + dzi
+		zmr, zmi = ref[m][0], ref[m][1]
+		zr := zmr + dzr
+		zi := zmi + dzi
 		r2 := zr*zr + zi*zi
 		if r2 > escapeR2 {
 			colour(px, n, r2)
 			return
 		}
-		if r2 < dzr*dzr+dzi*dzi || m == refLen-1 {
+		if r2 < dzr*dzr+dzi*dzi || m == last {
 			dzr, dzi, m = zr, zi, 0 // rebase onto the start of the orbit
+			zmr, zmi = ref[0][0], ref[0][1]
 		}
 	}
 	px[0], px[1], px[2] = 0, 0, 0
