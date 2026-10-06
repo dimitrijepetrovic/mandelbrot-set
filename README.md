@@ -99,39 +99,38 @@ depth, so every pixel takes thousands of iterations in the deep frames.
 
 ### Results
 
-`scripts/bench.sh` (1280×720, 900 frames, `--no-video`, run with `nice -19` on an otherwise idle
-machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti Laptop GPU, default
-(`NATIVE=true`) build (2026-10-06). The CPU rows come from a CPU-only run after the lanes
-change. The GPU rows come from the previous full run; the GPU code didn't change.
+A single full run of `scripts/bench.sh` (1280×720, 900 frames, `--no-video`, run with
+`nice -19` on an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti
+Laptop GPU, default (`NATIVE=true`) build (2026-10-06):
 
 | lang | device | precision | render_s | render_fps |
 |------|--------|-----------|---------:|-----------:|
-| C++  | cpu    | f64       |   27.40  |  32.84 |
-| Rust | cpu    | f64       |   30.44  |  29.57 |
-| Go   | cpu    | f64       |   36.20  |  24.86 |
-| C++  | gpu    | f64       |   19.13  |  47.05 |
-| Rust | gpu    | f64       |   19.09  |  47.14 |
-| Go   | gpu    | f64       |   19.17  |  46.96 |
-| C++  | cpu    | deep      |  492.40  |   1.83 |
-| Rust | cpu    | deep      |  582.70  |   1.54 |
-| Go   | cpu    | deep      |  616.63  |   1.46 |
-| C++  | gpu    | deep      |  175.52  |   5.13 |
+| C++  | cpu    | f64       |   27.07  |  33.25 |
+| Rust | cpu    | f64       |   31.04  |  28.99 |
+| Go   | cpu    | f64       |   36.45  |  24.69 |
+| C++  | gpu    | f64       |   19.15  |  46.99 |
+| Rust | gpu    | f64       |   19.15  |  47.01 |
+| Go   | gpu    | f64       |   19.16  |  46.98 |
+| C++  | cpu    | deep      |  496.17  |   1.81 |
+| Rust | cpu    | deep      |  583.73  |   1.54 |
+| Go   | cpu    | deep      |  617.61  |   1.46 |
+| C++  | gpu    | deep      |  175.48  |   5.13 |
 | Rust | gpu    | deep      |  176.85  |   5.09 |
 | Go   | gpu    | deep      |  176.84  |   5.09 |
 
 The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
 three languages are within 1% of each other, because they run the same kernel. In f64 the CPUs
-now reach 53–70% of the GPU's speed. Deep mode gains less on the CPU, because each lane loads
+now reach 53–71% of the GPU's speed. Deep mode gains less on the CPU, because each lane loads
 its reference orbit entry from a different index on every step.
 
 **CPU history.** Render fps over the same benchmark:
 
 | precision | lang | original | bounds checks + SLP fix | 8 SIMD lanes + native |
 |-----------|------|---------:|------------------------:|----------------------:|
-| f64       | C++  |  11.97   | 12.86                   | **32.84**             |
-| f64       | Rust |   8.27   | 11.48                   | **29.57**             |
-| f64       | Go   |  11.03   | 11.56                   | **24.86**             |
-| deep      | C++  |   1.43   |  1.49                   | **1.83**              |
+| f64       | C++  |  11.97   | 12.86                   | **33.25**             |
+| f64       | Rust |   8.27   | 11.48                   | **28.99**             |
+| f64       | Go   |  11.03   | 11.56                   | **24.69**             |
+| deep      | C++  |   1.43   |  1.49                   | **1.81**              |
 | deep      | Rust |   1.21   |  1.45                   | **1.54**              |
 | deep      | Go   |   1.21   |  1.34                   | **1.46**              |
 
