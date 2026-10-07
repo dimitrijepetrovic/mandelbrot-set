@@ -25,11 +25,12 @@ type Options struct {
 	Threads            int
 	Encoder, Output    string
 	NoVideo            bool
+	GPUFP32            bool
 }
 
 func parseOptions() Options {
 	var o Options
-	flag.StringVar(&o.Device, "device", "cpu", "compute device: cpu|gpu")
+	flag.StringVar(&o.Device, "device", "cpu", "compute device: cpu|gpu|both (both: CPU and GPU render alternate frames)")
 	flag.StringVar(&o.Precision, "precision", "f64", "f64 = plain doubles (zoom <= ~1e12), deep = perturbation (zoom <= 1e300)")
 	flag.IntVar(&o.Width, "width", 1920, "frame width")
 	flag.IntVar(&o.Height, "height", 1080, "frame height")
@@ -44,6 +45,7 @@ func parseOptions() Options {
 	flag.StringVar(&o.Encoder, "encoder", "libx264", "ffmpeg video encoder")
 	flag.StringVar(&o.Output, "output", "", "output file (default mandelbrot_go_<device>_<precision>.mp4)")
 	flag.BoolVar(&o.NoVideo, "no-video", false, "render only, skip ffmpeg (pure compute benchmark)")
+	flag.BoolVar(&o.GPUFP32, "gpu-fp32", false, "deep mode on the GPU in float32: much faster, not bit-identical to the CPU (zoom <= ~1e63)")
 	flag.Parse()
 
 	fail := func(msg string) {
@@ -51,8 +53,8 @@ func parseOptions() Options {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if o.Device != "cpu" && o.Device != "gpu" {
-		fail("--device must be cpu or gpu")
+	if o.Device != "cpu" && o.Device != "gpu" && o.Device != "both" {
+		fail("--device must be cpu, gpu or both")
 	}
 	if o.Precision != "f64" && o.Precision != "deep" {
 		fail("--precision must be f64 or deep")
@@ -65,6 +67,9 @@ func parseOptions() Options {
 	}
 	if o.Zoom < 1 || o.Zoom > maxZoom {
 		fail("--zoom must be between 1 and 1e300")
+	}
+	if o.GPUFP32 && (o.Precision != "deep" || o.Device == "cpu") {
+		fail("--gpu-fp32 needs --precision deep and --device gpu or both")
 	}
 	if o.Output == "" {
 		o.Output = fmt.Sprintf("mandelbrot_go_%s_%s.mp4", o.Device, o.Precision)

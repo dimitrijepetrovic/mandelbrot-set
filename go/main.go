@@ -2,10 +2,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -112,16 +114,17 @@ func run() error {
 		return fmt.Errorf("invalid centre: %w", err)
 	}
 
-	var renderer Renderer
-	if o.Device == "cpu" {
-		renderer = newCPURenderer(o, cre, cim, orbit)
-	} else {
+	var renderers []Renderer
+	if o.Device != "gpu" {
+		renderers = append(renderers, newCPURenderer(o, cre, cim, orbit))
+	}
+	if o.Device != "cpu" {
 		g, err := newGPURenderer(o, cre, cim, orbit)
 		if err != nil {
 			return err
 		}
 		defer g.Close()
-		renderer = g
+		renderers = append(renderers, g)
 	}
 
 	var video *VideoWriter
@@ -131,39 +134,143 @@ func run() error {
 		}
 	}
 
-	rgb := make([]byte, o.Width*o.Height*3)
-	var renderS, writeS float64
-	for i := range frames {
-		f := frameAt(i)
-		t0 := time.Now()
-		if err := renderer.Render(f, rgb); err != nil {
-			return err
-		}
-		renderS += time.Since(t0).Seconds()
-		if video != nil {
-			t0 = time.Now()
-			if err := video.Write(rgb); err != nil {
-				return err
-			}
-			writeS += time.Since(t0).Seconds()
-		}
-		fmt.Fprintf(os.Stderr, "\rframe %d/%d  max_iter %d", i+1, frames, f.MaxIter)
+	// One worker goroutine per device takes the next frame number from a shared counter,
+	// so with --device both the faster device renders more frames. Near the end a device
+	// stops if the other would finish all remaining frames before it finished one more
+	// (the last frames are the most expensive), so neither waits on the other. This goroutine writes
+	// finished frames to ffmpeg in order while the workers render ahead, so encoding
+	// overlaps rendering. Frame buffers are allocated as needed, so a fast device can
+	// run ahead of a slow one's frame (up to maxBufs frames in flight).
+	type result struct {
+		i   int
+		rgb []byte
 	}
+	frameBytes := o.Width * o.Height * 3
+	maxBufs := min(max((1<<30)/frameBytes, 3), 64)
+	free := make(chan []byte, maxBufs) // buffers to render into
+	done := make(chan result, maxBufs)
+	stop := make(chan struct{}) // closed when anything fails
+	var stopOnce sync.Once
+	abort := func() { stopOnce.Do(func() { close(stop) }) }
+	errs := make([]error, len(renderers))
+	rendered := make([]int, len(renderers))
+	var mu sync.Mutex // guards nextFrame, lastS and bufs
+	nextFrame, lastS, bufs := 0, make([]float64, len(renderers)), 0
+	newBuf := func() []byte { // a new buffer, or nil at maxBufs
+		mu.Lock()
+		defer mu.Unlock()
+		if bufs == maxBufs {
+			return nil
+		}
+		bufs++
+		return make([]byte, frameBytes)
+	}
+	claim := func(w int) (int, bool) { // the next frame for worker w, or false to stop
+		mu.Lock()
+		defer mu.Unlock()
+		for v := range lastS {
+			if v != w && lastS[v] > 0 && float64(frames-nextFrame)*lastS[v] < lastS[w] {
+				return 0, false
+			}
+		}
+		nextFrame++
+		return nextFrame - 1, nextFrame <= frames
+	}
+	var wg sync.WaitGroup
+	renderStart := time.Now()
+	for w, r := range renderers {
+		wg.Go(func() {
+			for {
+				var rgb []byte
+				select {
+				case rgb = <-free:
+				default:
+					if rgb = newBuf(); rgb == nil {
+						select {
+						case rgb = <-free:
+						case <-stop:
+							return
+						}
+					}
+				}
+				i, ok := claim(w)
+				if !ok {
+					return
+				}
+				t0 := time.Now()
+				if errs[w] = r.Render(frameAt(i), rgb); errs[w] != nil {
+					abort()
+					return
+				}
+				mu.Lock()
+				lastS[w] = time.Since(t0).Seconds()
+				mu.Unlock()
+				rendered[w]++
+				done <- result{i, rgb} // never blocks: done holds every buffer
+			}
+		})
+	}
+	writeErr := func() error {
+		pending := map[int][]byte{} // rendered, not yet written
+		for i := 0; i < frames; {
+			rgb, ok := pending[i]
+			if !ok {
+				select {
+				case res := <-done:
+					pending[res.i] = res.rgb
+				case <-stop:
+					return nil // a worker's error is reported below
+				}
+				continue
+			}
+			delete(pending, i)
+			if video != nil {
+				if err := video.Write(rgb); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(os.Stderr, "\rframe %d/%d  max_iter %d", i+1, frames, frameAt(i).MaxIter)
+			free <- rgb
+			i++
+		}
+		return nil
+	}()
+	if writeErr != nil {
+		abort()
+	}
+	wg.Wait()
 	fmt.Fprintln(os.Stderr)
+	if err := errors.Join(append(errs, writeErr)...); err != nil {
+		return err
+	}
+	// renderS: until the last frame was rendered and written (encoding overlaps it);
+	// writeS: flushing ffmpeg after that.
+	renderS, writeS := time.Since(renderStart).Seconds(), 0.0
 	output := "-"
 	if video != nil {
 		t0 := time.Now()
 		if err := video.Finish(); err != nil {
 			return err
 		}
-		writeS += time.Since(t0).Seconds()
+		writeS = time.Since(t0).Seconds()
 		output = o.Output
+	}
+	if o.Device == "both" {
+		fmt.Fprintf(os.Stderr, "frames rendered: cpu %d, gpu %d\n", rendered[0], rendered[1])
 	}
 	totalS := time.Since(start).Seconds()
 
 	fmt.Printf("lang=go device=%s precision=%s size=%dx%d frames=%d zoom=%.3g ref_s=%.3f "+
 		"render_s=%.3f write_s=%.3f total_s=%.3f render_fps=%.2f output=%s\n",
-		o.Device, o.Precision, o.Width, o.Height, frames, o.Zoom, refS,
+		o.Device, precisionName(o), o.Width, o.Height, frames, o.Zoom, refS,
 		renderS, writeS, totalS, float64(frames)/renderS, output)
 	return nil
+}
+
+// precisionName is the summary line's precision: deep-fp32 for --gpu-fp32.
+func precisionName(o Options) string {
+	if o.GPUFP32 {
+		return "deep-fp32"
+	}
+	return o.Precision
 }

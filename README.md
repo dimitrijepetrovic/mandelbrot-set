@@ -1,8 +1,8 @@
 # Mandelbrot Set
 
 A comparison of **C++**, **Rust** and **Go**, each rendering the same colour video zooming into the
-Mandelbrot set. Each implementation can run on the **CPU** or on an NVIDIA **GPU** (CUDA), and in two
-precision modes, all selected by command-line flags:
+Mandelbrot set. Each implementation can run on the **CPU**, on an NVIDIA **GPU** (CUDA), or on
+**both** at once, and in two precision modes, all selected by command-line flags:
 
 | Mode    | Arithmetic                                                     | Max zoom |
 |---------|----------------------------------------------------------------|----------|
@@ -12,6 +12,10 @@ precision modes, all selected by command-line flags:
 All three implementations follow the same algorithm (see [Algorithm](#algorithm)) and produce
 **bit-identical frames** (checked by `scripts/verify.sh`), so the timings compare the
 languages and not different maths.
+
+On the GPU, deep mode can also run in float32 (`--gpu-fp32`). It is about 18× faster and looks
+the same, but it is not bit-identical to the float64 modes (see
+[GPU float32 deep mode](#gpu-float32-deep-mode)).
 
 ## Layout
 
@@ -58,11 +62,13 @@ All three binaries take the same flags:
 bin/mandelbrot-rust --device gpu                       # 1080p30, 20 s, f64 zoom to 1e12
 bin/mandelbrot-go   --device gpu --precision deep      # perturbation zoom to 1e50
 bin/mandelbrot-cpp  --device cpu --precision deep --zoom 1e100 --duration 30
+bin/mandelbrot-rust --device gpu --precision deep --gpu-fp32   # float32 on the GPU: ~18x faster
+bin/mandelbrot-go   --device both --precision deep             # CPU and GPU share the frames
 ```
 
 | Flag                | Default            | Meaning |
 |---------------------|--------------------|---------|
-| `--device`          | `cpu`              | `cpu` or `gpu` |
+| `--device`          | `cpu`              | `cpu`, `gpu` or `both` (CPU and GPU render different frames) |
 | `--precision`       | `f64`              | `f64` or `deep` |
 | `--width --height`  | `1920 1080`        | frame size |
 | `--fps`             | `30`               | frames per second |
@@ -75,6 +81,7 @@ bin/mandelbrot-cpp  --device cpu --precision deep --zoom 1e100 --duration 30
 | `--encoder`         | `libx264`          | any ffmpeg encoder, e.g. `h264_nvenc`, `libx265`, `ffv1` |
 | `--output`          | `mandelbrot_<lang>_<device>_<precision>.mp4` | output file |
 | `--no-video`        | off                | render only, skip ffmpeg (pure compute benchmark) |
+| `--gpu-fp32`        | off                | deep mode on the GPU in float32; needs `--precision deep` and `--device gpu` or `both` |
 
 Each run ends with one summary line on stdout:
 
@@ -82,13 +89,21 @@ Each run ends with one summary line on stdout:
 lang=rust device=gpu precision=f64 size=1920x1080 frames=600 zoom=1e+12 ref_s=0.000 render_s=28.915 write_s=5.693 total_s=34.860 render_fps=20.75 output=...
 ```
 
-`ref_s` is the reference orbit time (deep only), `render_s` is the frame computation time
-(including the GPU→host copy), and `write_s` is time spent blocked on ffmpeg.
+`ref_s` is the reference orbit time (deep only). `render_s` is the time until every frame has
+been rendered and handed to ffmpeg; encoding overlaps rendering. `write_s` is the time ffmpeg
+then needs to finish encoding. With `--gpu-fp32` the precision shows as `deep-fp32`, and with
+`--device both` a stderr line says how many frames each device rendered.
+
+Frames are rendered by one worker per device, each taking the next frame number from a shared
+counter, and the main thread writes them to ffmpeg in order. With `--device both` the faster
+device renders more frames. Frame buffers are allocated as needed, so the faster device can run
+ahead while the other finishes a frame. Near the end, a device stops taking frames if the other
+would finish all the remaining frames first.
 
 ## Benchmarking
 
 ```sh
-scripts/bench.sh                         # all 12 combinations, 720p, 30 s, no video
+scripts/bench.sh                         # all 24 combinations, 720p, 30 s, no video
 scripts/bench.sh --duration 20           # extra flags go to every run
 VIDEO=1 scripts/bench.sh                 # also write the videos to out/
 LANGS="cpp go" DEVICES=gpu PRECISIONS=f64 scripts/bench.sh
@@ -103,28 +118,48 @@ A single full run of `scripts/bench.sh` (1280×720, 900 frames, `--no-video`, ru
 `nice -19` on an otherwise idle machine) on an Intel i9-12900H (20 threads) with an RTX 3080 Ti
 Laptop GPU, default (`NATIVE=true`) build (2026-10-06):
 
-| lang | device | precision | render_s | render_fps |
-|------|--------|-----------|---------:|-----------:|
-| C++  | cpu    | f64       |   27.07  |  33.25 |
-| Rust | cpu    | f64       |   31.04  |  28.99 |
-| Go   | cpu    | f64       |   36.45  |  24.69 |
-| C++  | gpu    | f64       |   19.15  |  46.99 |
-| Rust | gpu    | f64       |   19.15  |  47.01 |
-| Go   | gpu    | f64       |   19.16  |  46.98 |
-| C++  | cpu    | deep      |  496.17  |   1.81 |
-| Rust | cpu    | deep      |  471.31* |   1.91 |
-| Go   | cpu    | deep      |  533.75* |   1.69 |
-| C++  | gpu    | deep      |  175.48  |   5.13 |
-| Rust | gpu    | deep      |  176.85  |   5.09 |
-| Go   | gpu    | deep      |  176.84  |   5.09 |
+| precision | device | C++ fps | Rust fps | Go fps |
+|-----------|--------|--------:|---------:|-------:|
+| f64       | cpu    |   29.30 |    27.38 |  23.27 |
+| f64       | gpu    |   46.94 |    46.95 |  46.66 |
+| f64       | both   |   72.72 |    69.56 |  59.63 |
+| deep      | cpu    |    1.71 |     1.86 |   1.63 |
+| deep      | gpu    |    5.11 |     5.08 |   5.05 |
+| deep      | both   |    6.41 |     6.49 |   6.13 |
+| deep-fp32 | gpu    |   93.83 |    93.74 |  93.37 |
+| deep-fp32 | both   |   86.35 |    87.35 |  75.05 |
 
-\* Rust and Go CPU deep were each re-run alone after the fixes described under "Rust deep"
-and "Go deep" below.
+Notes:
+- **Reference orbit:** it takes under 0.01 s in every language, so it is negligible.
+- **GPU:** the three languages are within 1% of each other, because they run the same kernel.
+- **Run-to-run variation:** the CPU rows are 5–12% below an earlier full run of the same code
+  (f64 33.25 / 28.99 / 24.69 fps, deep 1.81 / 1.91 / 1.69 fps). This is a laptop, and the
+  long run changes its thermal state, so treat CPU differences of that size as noise.
+- **`--device both`:** it adds the CPU to the GPU. f64 reaches 1.5× the GPU alone (the CPU
+  rendered about a third of the frames) and deep 1.25×. With `--gpu-fp32` the GPU is about 50×
+  faster than the CPU, so the CPU only slows it down; use `--device gpu` there.
 
-The reference orbit takes under 0.01 s in every language, so it is negligible. On the GPU the
-three languages are within 1% of each other, because they run the same kernel. In f64 the CPUs
-now reach 53–71% of the GPU's speed. Deep mode gains less on the CPU, because each lane loads
-its reference orbit entry from a different index on every step.
+### GPU profile
+
+Nsight Systems shows the kernel is 98–99% of GPU render time. The device-to-host copy of each
+frame takes about 0.29 ms (1.3%). Nsight Compute needs admin rights for hardware counters, so I
+estimated efficiency instead. I replayed the kernels' exact per-pixel iteration counts on the
+CPU and compared them with the FP64 peak of this GPU. The peak is 58 SMs × 2 FP64 operations per
+clock × 1.95 GHz, about 2.3×10¹¹ instructions/s.
+
+| kernel | FP64 instructions / iteration | SIMT efficiency | achieved vs FP64 peak |
+|--------|------------------------------:|----------------:|----------------------:|
+| f64    |  8 | 89% | 81% |
+| deep   | 15 | 97% | 80% |
+
+SIMT efficiency is the share of each 32-thread warp's work that is useful; a warp runs until its
+slowest pixel finishes. Both kernels are therefore limited by FP64 throughput, with little to
+gain inside them. The gains came from outside the kernels:
+- **`--gpu-fp32`** moves deep mode to the FP32 units, 18× faster: 5.1 → 93.8 fps.
+- **`--device both`** adds the CPU.
+- **Overlapping rendering with ffmpeg** saves about 6% of total time for a GPU f64 1080p
+  libx264 video (9.4 → 8.9 s). ffmpeg already encoded in parallel through its pipe; what
+  remains of `write_s` is libx264 flushing its lookahead frames at the end.
 
 **CPU history.** Render fps over the same benchmark:
 
@@ -224,14 +259,34 @@ period 2), refined to 340 digits by `tools/misiurewicz.py`. Misiurewicz points s
 boundary of the set and have spiral detail at every scale, so the zoom never ends in a featureless
 region, even at 1e300.
 
+### GPU float32 deep mode
+
+Consumer GeForce GPUs run float64 at 1/64 of their float32 rate. `--gpu-fp32` uses the
+`mandel_perturb_f32` kernel, the same perturbation loop in float32 with the reference orbit
+rounded to float. It needs no change for zooms down to float32's range limit, but the pixel
+offsets `δc` of a 1e50 zoom (~1e-53) are far below float32's smallest value (~1e-38). So each
+pixel runs in two phases:
+
+1. **Scaled.** The deltas are stored divided by `2^k`, where `spacing = f·2^k`, so `δc/2^k` is
+   about ±width/2. The recurrence is linear in that scale: `w ← (2Z_m + δz)·w + δc/2^k`, with
+   `δz = w·2^k` applied as two float multiplies. `δz` may round to 0 here, but then it is
+   negligible next to `2Z_m`.
+2. **Plain.** Once `|δz| ≥ 2^-100`, the pixel continues with ordinary float32 deltas and
+   rebasing. `δc` may now round to 0, but it is then negligible next to `δz`.
+
+This works while `spacing ≥ 2^-220`, about a 1e63 zoom at 1080p. Deeper frames use the float64
+kernel. The frames look the same as float64: chaotic boundary pixels escape at slightly
+different iterations, but no structure changes. They are not bit-identical, though: PSNR is
+about 21 dB against float64, and every language produces the same float32 frames.
+
 ## Verification
 
 ```sh
 scripts/verify.sh
 ```
 
-`verify.sh` renders a short clip losslessly (`ffv1`) with all 12 variants and checks that C++,
-Rust and Go are bit-identical for each device/precision pair. CPU vs GPU output differs slightly
+`verify.sh` renders a short clip losslessly (`ffv1`) with all 12 variants, plus GPU deep with
+`--gpu-fp32`. It checks that C++, Rust and Go are bit-identical for each combination. CPU vs GPU output differs slightly
 by default (PSNR ≈ 30 dB for f64, ≈ 52 dB for deep), because nvcc fuses multiply-adds (FMA)
 and the chaotic iteration amplifies the rounding differences. After `make CUDA_FMAD=false`,
 all 12 variants produce identical frames, at the cost of about 30% GPU speed.

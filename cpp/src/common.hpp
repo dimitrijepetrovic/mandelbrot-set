@@ -23,7 +23,7 @@ inline constexpr double kSqrtHalf = 0.7071067811865476;
 inline constexpr double kViewHeight = 3.0;  // complex-plane height of frame 0
 inline constexpr double kMaxZoom = 1e300;   // f64 deltas underflow beyond this
 
-enum class Device { Cpu, Gpu };
+enum class Device { Cpu, Gpu, Both };
 enum class Precision { F64, Deep };
 
 struct Options {
@@ -42,9 +42,11 @@ struct Options {
     std::string encoder = "libx264";
     std::string output;  // empty = default name
     bool no_video = false;
+    bool gpu_fp32 = false;  // deep on the GPU in float32 (mandel_perturb_f32)
 };
 
 Options parse_options(int argc, char** argv);
+const char* device_name(Device d);
 
 // exp/ln built only from correctly rounded IEEE operations and exact power-of-two
 // scaling, so all three languages compute bit-identical frame parameters

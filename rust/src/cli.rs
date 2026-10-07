@@ -10,6 +10,8 @@ const MAX_ZOOM: f64 = 1e300; // f64 deltas underflow beyond this
 pub enum Device {
     Cpu,
     Gpu,
+    /// CPU and GPU render alternate frames.
+    Both,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -25,6 +27,7 @@ impl Device {
         match self {
             Device::Cpu => "cpu",
             Device::Gpu => "gpu",
+            Device::Both => "both",
         }
     }
 }
@@ -84,6 +87,9 @@ pub struct Args {
     /// Render only, skip ffmpeg (pure compute benchmark).
     #[arg(long)]
     pub no_video: bool,
+    /// Deep mode on the GPU in float32: much faster, not bit-identical to the CPU (zoom <= ~1e63).
+    #[arg(long)]
+    pub gpu_fp32: bool,
 }
 
 impl Args {
@@ -97,6 +103,10 @@ impl Args {
             Precision::Deep => 1e50,
         });
         anyhow::ensure!((1.0..=MAX_ZOOM).contains(&zoom), "--zoom must be between 1 and 1e300");
+        anyhow::ensure!(
+            !self.gpu_fp32 || (self.precision == Precision::Deep && self.device != Device::Cpu),
+            "--gpu-fp32 needs --precision deep and --device gpu or both"
+        );
         self.output.get_or_insert_with(|| {
             format!("mandelbrot_rust_{}_{}.mp4", self.device.name(), self.precision.name())
         });

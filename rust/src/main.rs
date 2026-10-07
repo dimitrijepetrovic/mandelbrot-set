@@ -4,7 +4,10 @@ mod gpu;
 mod reference;
 mod video;
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::{Condvar, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use clap::Parser;
@@ -27,7 +30,27 @@ pub struct Frame {
     pub max_iter: i32,
 }
 
-pub trait Renderer {
+/// Frames shared between the render workers and the writer (see `run`).
+struct Pipeline {
+    free: Vec<Vec<u8>>,           // buffers to render into
+    bufs: usize,                  // buffers allocated
+    done: BTreeMap<i32, Vec<u8>>, // rendered, not yet written
+    rendered: Vec<i32>,           // frames per worker
+    last_s: Vec<f64>,             // each worker's latest frame time
+    next_frame: i32,              // the next frame to render
+    failed: bool,                 // a worker or the writer failed: stop
+}
+
+impl Pipeline {
+    /// Whether worker `w` should stop: another worker would render all remaining frames
+    /// before `w` finished one more.
+    fn yields(&self, w: usize, frames: i32) -> bool {
+        let remaining = (frames - self.next_frame) as f64;
+        (0..self.last_s.len()).any(|v| v != w && self.last_s[v] > 0.0 && remaining * self.last_s[v] < self.last_s[w])
+    }
+}
+
+pub trait Renderer: Send {
     fn render(&mut self, frame: Frame, rgb: &mut [u8]) -> anyhow::Result<()>;
 }
 
@@ -107,10 +130,13 @@ fn run() -> anyhow::Result<()> {
     };
     let cre: f64 = args.centre_re.parse()?;
     let cim: f64 = args.centre_im.parse()?;
-    let mut renderer: Box<dyn Renderer> = match args.device {
-        Device::Cpu => Box::new(cpu::CpuRenderer::new(&args, cre, cim, orbit)?),
-        Device::Gpu => Box::new(gpu::GpuRenderer::new(&args, cre, cim, orbit)?),
-    };
+    let mut renderers: Vec<Box<dyn Renderer>> = Vec::new();
+    if args.device != Device::Gpu {
+        renderers.push(Box::new(cpu::CpuRenderer::new(&args, cre, cim, orbit.clone())?));
+    }
+    if args.device != Device::Cpu {
+        renderers.push(Box::new(gpu::GpuRenderer::new(&args, cre, cim, orbit)?));
+    }
 
     let output = args.output.clone().unwrap();
     let mut video = if args.no_video {
@@ -119,26 +145,106 @@ fn run() -> anyhow::Result<()> {
         Some(video::VideoWriter::new(&output, args.width, args.height, args.fps, &args.encoder)?)
     };
 
-    let mut rgb = vec![0u8; args.width as usize * args.height as usize * 3];
-    let (mut render_s, mut write_s) = (0.0, 0.0);
-    for i in 0..frames {
-        let f = frame_at(i);
-        let t0 = Instant::now();
-        renderer.render(f, &mut rgb)?;
-        render_s += t0.elapsed().as_secs_f64();
-        if let Some(v) = video.as_mut() {
-            let t0 = Instant::now();
-            v.write(&rgb)?;
-            write_s += t0.elapsed().as_secs_f64();
+    // One worker thread per device takes the next frame number from a shared counter,
+    // so with --device both the faster device renders more frames. Near the end a device
+    // stops if the other would finish all remaining frames before it finished one more
+    // (the last frames are the most expensive), so neither waits on the other. The main thread
+    // writes finished frames to ffmpeg in order while the workers render ahead, so
+    // encoding overlaps rendering. Frame buffers are allocated as needed, so a fast
+    // device can run ahead of a slow one's frame (up to max_bufs frames in flight).
+    let frame_bytes = args.width as usize * args.height as usize * 3;
+    let max_bufs = ((1usize << 30) / frame_bytes).clamp(3, 64);
+    let state = Mutex::new(Pipeline {
+        free: Vec::new(),
+        bufs: 0,
+        done: BTreeMap::new(),
+        rendered: vec![0; renderers.len()],
+        last_s: vec![0.0; renderers.len()],
+        next_frame: 0,
+        failed: false,
+    });
+    let cv = Condvar::new();
+    let render_start = Instant::now();
+    let result = thread::scope(|scope| -> anyhow::Result<()> {
+        let workers: Vec<_> = renderers
+            .iter_mut()
+            .enumerate()
+            .map(|(w, r)| {
+                let (state, cv) = (&state, &cv);
+                scope.spawn(move || -> anyhow::Result<()> {
+                    let result = (|| loop {
+                        let (i, mut rgb) = {
+                            let mut s = cv
+                                .wait_while(state.lock().unwrap(), |s| s.free.is_empty() && s.bufs >= max_bufs && !s.failed)
+                                .unwrap();
+                            if s.failed || s.next_frame >= frames || s.yields(w, frames) {
+                                return Ok(());
+                            }
+                            s.next_frame += 1;
+                            let rgb = s.free.pop().unwrap_or_else(|| {
+                                s.bufs += 1;
+                                vec![0u8; frame_bytes]
+                            });
+                            (s.next_frame - 1, rgb)
+                        };
+                        let t0 = Instant::now();
+                        r.render(frame_at(i), &mut rgb)?;
+                        let mut s = state.lock().unwrap();
+                        s.last_s[w] = t0.elapsed().as_secs_f64();
+                        s.done.insert(i, rgb);
+                        s.rendered[w] += 1;
+                        cv.notify_all();
+                    })();
+                    if result.is_err() {
+                        state.lock().unwrap().failed = true;
+                        cv.notify_all();
+                    }
+                    result
+                })
+            })
+            .collect();
+        let written = (|| -> anyhow::Result<()> {
+            for i in 0..frames {
+                let rgb = {
+                    let mut s = cv.wait_while(state.lock().unwrap(), |s| !s.done.contains_key(&i) && !s.failed).unwrap();
+                    if s.failed {
+                        return Ok(()); // a worker's error is reported below
+                    }
+                    s.done.remove(&i).unwrap()
+                };
+                if let Some(v) = video.as_mut() {
+                    v.write(&rgb)?;
+                }
+                eprint!("\rframe {}/{}  max_iter {}", i + 1, frames, frame_at(i).max_iter);
+                std::io::stderr().flush().ok();
+                state.lock().unwrap().free.push(rgb);
+                cv.notify_all();
+            }
+            Ok(())
+        })();
+        if written.is_err() {
+            state.lock().unwrap().failed = true;
+            cv.notify_all();
         }
-        eprint!("\rframe {}/{}  max_iter {}", i + 1, frames, f.max_iter);
-        std::io::stderr().flush().ok();
-    }
+        for w in workers {
+            w.join().unwrap()?;
+        }
+        written
+    });
     eprintln!();
+    result?;
+    // render_s: until the last frame was rendered and written (encoding overlaps it);
+    // write_s: flushing ffmpeg after that.
+    let render_s = render_start.elapsed().as_secs_f64();
+    let mut write_s = 0.0;
     if let Some(v) = video {
         let t0 = Instant::now();
         v.finish()?;
-        write_s += t0.elapsed().as_secs_f64();
+        write_s = t0.elapsed().as_secs_f64();
+    }
+    if args.device == Device::Both {
+        let r = &state.lock().unwrap().rendered;
+        eprintln!("frames rendered: cpu {}, gpu {}", r[0], r[1]);
     }
     let total_s = start.elapsed().as_secs_f64();
 
@@ -146,7 +252,7 @@ fn run() -> anyhow::Result<()> {
         "lang=rust device={} precision={} size={}x{} frames={} zoom={} ref_s={:.3} render_s={:.3} \
          write_s={:.3} total_s={:.3} render_fps={:.2} output={}",
         args.device.name(),
-        args.precision.name(),
+        if args.gpu_fp32 { "deep-fp32" } else { args.precision.name() },
         args.width,
         args.height,
         frames,

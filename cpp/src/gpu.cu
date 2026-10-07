@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "common.hpp"
 #include "mandelbrot.cuh"
@@ -24,18 +25,29 @@ public:
             check(cudaMemcpy(ref_, orbit->data(), orbit->size() * sizeof(double),
                              cudaMemcpyHostToDevice),
                   "upload orbit");
+            if (o.gpu_fp32) {
+                std::vector<float> f(orbit->begin(), orbit->end());
+                check(cudaMalloc(&ref32_, f.size() * sizeof(float)), "cudaMalloc orbit");
+                check(cudaMemcpy(ref32_, f.data(), f.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                      "upload orbit");
+            }
         }
     }
 
     ~GpuRenderer() override {
         cudaFree(rgb_);
         if (ref_) cudaFree(ref_);
+        if (ref32_) cudaFree(ref32_);
     }
 
     void render(const Frame& f, std::vector<uint8_t>& rgb) override {
         dim3 block(16, 16);
         dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
-        if (ref_)
+        if (ref32_ && f.spacing >= MANDEL_F32_MIN_SPACING)
+            mandel_perturb_f32<<<grid, block>>>(rgb_, width_, height_, ref32_, ref_len_,
+                                                f.spacing, f.max_iter);
+        else if (ref_)
             mandel_perturb<<<grid, block>>>(rgb_, width_, height_, ref_, ref_len_, f.spacing,
                                             f.max_iter);
         else
@@ -51,6 +63,7 @@ private:
     size_t bytes_ = 0;
     unsigned char* rgb_ = nullptr;
     double* ref_ = nullptr;
+    float* ref32_ = nullptr;  // --gpu-fp32: the orbit rounded to float
     int ref_len_ = 0;
 };
 

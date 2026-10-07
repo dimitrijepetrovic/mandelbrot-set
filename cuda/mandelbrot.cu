@@ -66,3 +66,61 @@ extern "C" __global__ void mandel_perturb(unsigned char* rgb, int width, int hei
     }
     black(px);
 }
+
+extern "C" __global__ void mandel_perturb_f32(unsigned char* rgb, int width, int height,
+                                              const float* ref, int ref_len,
+                                              double spacing, int max_iter) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    unsigned char* px = rgb + 3 * ((size_t)y * width + x);
+
+    double dcr = (x + 0.5 - 0.5 * width) * spacing;
+    double dci = (0.5 * height - (y + 0.5)) * spacing;
+    int k;
+    frexp(spacing, &k);  // spacing = f * 2^k, f in [0.5, 1)
+
+    // Phase 1: deltas scaled by 2^-k, w = dz / 2^k, so dc / 2^k ~ +-width/2. The scale
+    // is applied as two float multiplies, s1 * s2 = 2^k, each a normal float (k >= -220).
+    // dz = w s1 s2 may underflow to 0 here, but then it is negligible next to 2Z.
+    const float s1 = ldexpf(1.0f, k / 2), s2 = ldexpf(1.0f, k - k / 2);
+    const float ur = (float)ldexp(dcr, -k), ui = (float)ldexp(dci, -k);
+    const float wmax = ldexpf(1.0f, -100 - k);  // switch once |dz| >= 2^-100
+    float wr = 0.0f, wi = 0.0f, zr = 0.0f, zi = 0.0f, r2 = 0.0f;
+    int m = 0, n = 1;
+    for (; n <= max_iter; ++n) {
+        // w' = (2Z + dz) w + u, the dz recurrence divided by 2^k
+        float tr = 2.0f * ref[2 * m] + wr * s1 * s2, ti = 2.0f * ref[2 * m + 1] + wi * s1 * s2;
+        float nr = tr * wr - ti * wi + ur;
+        wi = tr * wi + ti * wr + ui;
+        wr = nr;
+        ++m;
+        zr = ref[2 * m] + wr * s1 * s2;
+        zi = ref[2 * m + 1] + wi * s1 * s2;
+        r2 = zr * zr + zi * zi;
+        if (r2 > (float)ESCAPE_R2) { colour(px, n, r2); return; }
+        if (fabsf(wr) >= wmax || fabsf(wi) >= wmax || m == ref_len - 1) break;
+    }
+    if (n > max_iter) { black(px); return; }
+
+    // Phase 2: plain float deltas. dc may round to 0 here; it is then negligible next to dz.
+    float dzr = wr * s1 * s2, dzi = wi * s1 * s2;
+    const float fdcr = (float)dcr, fdci = (float)dci;
+    if (r2 < dzr * dzr + dzi * dzi || m == ref_len - 1) {  // finish phase 1's last iteration
+        dzr = zr; dzi = zi; m = 0;
+    }
+    for (++n; n <= max_iter; ++n) {
+        float tr = 2.0f * ref[2 * m] + dzr, ti = 2.0f * ref[2 * m + 1] + dzi;
+        float nr = tr * dzr - ti * dzi + fdcr;
+        dzi = tr * dzi + ti * dzr + fdci;
+        dzr = nr;
+        ++m;
+        float zr = ref[2 * m] + dzr, zi = ref[2 * m + 1] + dzi;
+        float r2 = zr * zr + zi * zi;
+        if (r2 > (float)ESCAPE_R2) { colour(px, n, r2); return; }
+        if (r2 < dzr * dzr + dzi * dzi || m == ref_len - 1) {
+            dzr = zr; dzi = zi; m = 0;  // rebase onto the start of the orbit
+        }
+    }
+    black(px);
+}
